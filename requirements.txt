@@ -2,3 +2,4 @@
 streamlit
 groq
 PyMuPDF
+google-genai
