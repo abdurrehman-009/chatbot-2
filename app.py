@@ -1,11 +1,17 @@
 
 import os
 import re
+import hashlib
 import streamlit as st
 import fitz
 from groq import Groq
+from google import genai
+from google.genai import types
 
-# -------------------- PAGE CONFIG --------------------
+# =========================================================
+# PAGE CONFIGURATION
+# =========================================================
+
 st.set_page_config(
     page_title="PDF Study AI",
     page_icon="📚",
@@ -13,7 +19,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# -------------------- CUSTOM DESIGN --------------------
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GEMINI_OCR_MODEL = "gemini-2.5-flash"
+
+MAX_HISTORY_MESSAGES = 8
+CHUNK_SIZE = 10000
+CHUNK_OVERLAP = 700
+
+# =========================================================
+# DESIGN
+# =========================================================
+
 st.markdown("""
 <style>
 .stApp {
@@ -40,7 +56,7 @@ st.markdown("""
     font-size: 16px;
 }
 div[data-testid="stChatMessage"] {
-    background: rgba(255,255,255,0.8);
+    background: rgba(255,255,255,0.85);
     border: 1px solid #dbeafe;
     border-radius: 14px;
     padding: 12px;
@@ -52,59 +68,147 @@ div[data-testid="stChatMessage"] {
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------- CONFIGURATION --------------------
-MODEL_NAME = "llama-3.3-70b-versatile"
-MAX_PDF_CHARS = 100_000
-MAX_HISTORY_MESSAGES = 8
+# =========================================================
+# API KEYS
+# =========================================================
 
-
-def get_api_key():
-    """Read the API key from Streamlit Secrets or environment variables."""
+def get_secret(name):
+    """Read secrets from Streamlit Cloud or environment variables."""
     try:
-        key = st.secrets.get("GROQ_API_KEY", "")
-        if key:
-            return key
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value).strip()
     except Exception:
         pass
 
-    return os.getenv("GROQ_API_KEY", "")
+    return os.getenv(name, "").strip()
 
 
-def extract_pdf_text(uploaded_file):
-    """Extract text from all readable pages of the uploaded PDF."""
-    text_parts = []
-    page_count = 0
+# =========================================================
+# PDF EXTRACTION AND GEMINI OCR
+# =========================================================
+
+def extract_pdf_text(uploaded_file, gemini_client):
+    """
+    Extract selectable text normally.
+    If a page has little or no text, render it as an image and ask
+    Gemini to perform visual text recognition.
+    """
+
+    pdf_bytes = uploaded_file.getvalue()
+    extracted_pages = []
+    ocr_pages = 0
+    total_pages = 0
 
     try:
-        with fitz.open(stream=uploaded_file.getvalue(), filetype="pdf") as pdf:
-            page_count = len(pdf)
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
+            total_pages = len(pdf)
+
+            if total_pages == 0:
+                raise ValueError("The PDF contains no pages.")
+
+            progress = st.progress(0)
+            status = st.empty()
 
             for page_number, page in enumerate(pdf, start=1):
+                status.info(
+                    f"Reading page {page_number} of {total_pages}..."
+                )
+
+                # First try ordinary text extraction.
                 page_text = page.get_text("text").strip()
 
-                if page_text:
-                    text_parts.append(
-                        f"\n--- PAGE {page_number} ---\n{page_text}"
-                    )
+                # If the page is scanned, use Gemini OCR.
+                if len(page_text) < 40:
+                    try:
+                        # Render at moderate resolution to limit memory use.
+                        pix = page.get_pixmap(
+                            matrix=fitz.Matrix(1.35, 1.35),
+                            alpha=False
+                        )
+                        image_bytes = pix.tobytes("png")
 
+                        ocr_prompt = """
+You are performing OCR on a page from a student's study PDF.
+
+Transcribe all readable text on this page as accurately as possible.
+Preserve headings, paragraphs, numbered lists, formulas, definitions,
+tables, and labels where possible.
+
+Do not summarize, explain, or answer questions.
+Do not invent missing words. Mark genuinely unreadable text as [unclear].
+Return only the recognized page text.
+"""
+
+                        response = gemini_client.models.generate_content(
+                            model=GEMINI_OCR_MODEL,
+                            contents=[
+                                ocr_prompt,
+                                types.Part.from_bytes(
+                                    data=image_bytes,
+                                    mime_type="image/png"
+                                )
+                            ]
+                        )
+
+                        recognized_text = (
+                            response.text.strip()
+                            if response.text
+                            else ""
+                        )
+
+                        if recognized_text:
+                            page_text = recognized_text
+                            ocr_pages += 1
+
+                    except Exception as exc:
+                        status.warning(
+                            f"OCR failed on page {page_number}. "
+                            "Continuing with other pages."
+                        )
+                        # Keep any text extracted before OCR.
+                        if not page_text:
+                            page_text = (
+                                f"[Text could not be extracted from "
+                                f"page {page_number}.]"
+                            )
+
+                extracted_pages.append(
+                    f"\n--- PAGE {page_number} ---\n{page_text}"
+                )
+
+                progress.progress(page_number / total_pages)
+
+            progress.empty()
+            status.empty()
+
+    except ValueError:
+        raise
     except Exception as exc:
         raise ValueError(
-            "The PDF could not be opened. Please upload a valid PDF."
+            "Could not open this PDF. It may be damaged, encrypted, "
+            "or unsupported."
         ) from exc
 
-    full_text = "\n".join(text_parts).strip()
+    complete_text = "\n".join(extracted_pages).strip()
 
-    if not full_text:
+    if not complete_text or not any(
+        len(page.strip()) > 40
+        for page in extracted_pages
+    ):
         raise ValueError(
-            "No readable text was found. If your PDF contains scanned "
-            "images, OCR is needed before this app can read it."
+            "No useful text could be extracted. Check that the PDF "
+            "is readable and try again."
         )
 
-    return full_text, page_count
+    return complete_text, total_pages, ocr_pages
 
 
-def split_text(text, chunk_size=11000, overlap=800):
-    """Split extracted text into overlapping chunks."""
+# =========================================================
+# TEXT CHUNKING
+# =========================================================
+
+def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     chunks = []
     start = 0
 
@@ -112,7 +216,6 @@ def split_text(text, chunk_size=11000, overlap=800):
         end = min(start + chunk_size, len(text))
         chunk = text[start:end]
 
-        # Try to end near a paragraph boundary.
         if end < len(text):
             boundary = chunk.rfind("\n")
             if boundary > chunk_size * 0.65:
@@ -130,85 +233,115 @@ def split_text(text, chunk_size=11000, overlap=800):
     return chunks
 
 
+# =========================================================
+# GROQ CHAT COMPLETION
+# =========================================================
+
 def call_groq(client, system_prompt, user_prompt, history=None):
-    """Send a request to the Groq chat completion API."""
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [
+        {"role": "system", "content": system_prompt}
+    ]
 
     if history:
         messages.extend(history[-MAX_HISTORY_MESSAGES:])
 
-    messages.append({"role": "user", "content": user_prompt})
+    messages.append({
+        "role": "user",
+        "content": user_prompt
+    })
 
     response = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=GROQ_MODEL,
         messages=messages,
-        temperature=0.3,
-        max_completion_tokens=3500
+        temperature=0.25,
+        max_tokens=3500
     )
 
     answer = response.choices[0].message.content
 
     if not answer:
-        raise RuntimeError("The AI returned an empty response.")
+        raise RuntimeError("Groq returned an empty response.")
 
     return answer
 
 
+# =========================================================
+# TOPIC EXTRACTION
+# =========================================================
+
 def build_topic_list(client, chunks):
-    """Ask the model to identify topics from every PDF section."""
-    all_topics = []
+    extracted_lists = []
 
     for index, chunk in enumerate(chunks, start=1):
         prompt = f"""
-Read this section of the student's PDF.
+Identify the main topics and subtopics in this course material.
+
+Include definitions, key terms, theories, models, processes, formulas,
+classifications, examples, and comparisons when present.
 
 SECTION {index} OF {len(chunks)}:
 {chunk}
 
-Identify all distinct:
-- Main topics and subtopics
-- Definitions and key terms
-- Models, theories, and frameworks
-- Processes, formulas, and classifications
-- Important examples and comparisons
-
-Return a concise bullet list of topic names only.
-Include only topics supported by this section.
-Do not invent topics.
+Return a concise bullet list of topic names.
+Use only information supported by this section.
 """
-        result = call_groq(
+
+        answer = call_groq(
             client,
-            "You are a careful academic PDF topic extractor.",
+            "You are a careful academic topic extractor.",
             prompt
         )
-        all_topics.append(f"SECTION {index}\n{result}")
 
-    combined = "\n\n".join(all_topics)
+        extracted_lists.append(
+            f"SECTION {index}\n{answer}"
+        )
 
-    # Ask the model to merge duplicates across sections.
-    final_topics = call_groq(
+    combined = "\n\n".join(extracted_lists)
+
+    # Merge lists in batches to avoid an excessively long final prompt.
+    batch_size = 12
+    merged_batches = []
+
+    for start in range(0, len(extracted_lists), batch_size):
+        batch = "\n\n".join(
+            extracted_lists[start:start + batch_size]
+        )
+
+        merged = call_groq(
+            client,
+            "Organize course topics accurately. Never invent topics.",
+            f"""
+Merge the following topic lists.
+Remove duplicates, retain important subtopics, and organize them
+under clear headings. Return a numbered outline.
+
+{batch}
+"""
+        )
+        merged_batches.append(merged)
+
+    if len(merged_batches) == 1:
+        return merged_batches[0]
+
+    return call_groq(
         client,
-        "You organize study topics accurately and avoid inventing information.",
+        "You are an accurate academic syllabus organizer.",
         f"""
-Merge the following extracted topic lists into one organized outline.
-Remove duplicates, preserve important subtopics, and group related
-topics together. Use numbered headings and bullet points.
+Combine these topic outlines into one complete outline.
+Remove duplicate topics but preserve distinct subtopics.
+Use numbered headings and bullets. Do not invent topics.
 
-EXTRACTED LISTS:
-{combined[:50000]}
-
-Return the outline only.
+{chr(10).join(merged_batches)[:50000]}
 """
     )
 
-    return final_topics
 
+# =========================================================
+# ASK QUESTIONS ABOUT THE PDF
+# =========================================================
 
 def answer_question(client, question, chunks, history=None):
-    """
-    Find relevant PDF sections using keyword matching, then ask Groq
-    to answer using those sections.
-    """
+    # Simple keyword-based retrieval of likely relevant sections.
     terms = set(
         word.lower()
         for word in re.findall(r"[a-zA-Z0-9_+-]+", question)
@@ -222,87 +355,126 @@ def answer_question(client, question, chunks, history=None):
             word.lower()
             for word in re.findall(r"[a-zA-Z0-9_+-]+", chunk)
         )
+
         score = len(terms.intersection(chunk_terms))
         ranked.append((score, index, chunk))
 
     ranked.sort(key=lambda item: item[0], reverse=True)
 
-    # Include the best matching chunks; retain PDF order for readability.
-    selected = sorted(ranked[:5], key=lambda item: item[1])
+    # Include the best matching sections in original PDF order.
+    selected = sorted(ranked[:6], key=lambda item: item[1])
     context = "\n\n".join(item[2] for item in selected)
 
     system_prompt = """
-You are PDF Study AI, a patient and accurate academic tutor.
+You are PDF Study AI, a clear and accurate academic tutor.
 
-IMPORTANT RULES:
-1. Use the supplied PDF excerpts as the primary source.
-2. Never claim you have covered every detail if the supplied excerpts
-   do not support that claim.
-3. If the answer is not available in the excerpts, say so clearly.
-   You may give general background, but label it separately.
-4. Explain in simple English suitable for a student preparing for an exam.
-5. For a topic question, organize the response using:
-   - Definition
-   - Detailed explanation
-   - Key points or characteristics
-   - Types, steps, or examples, when relevant
-   - Advantages and disadvantages, when relevant
-   - Comparison table, when a meaningful comparison exists
-   - Short exam-ready answer
-6. Do not force a comparison when no meaningful comparison exists.
-7. For a comparison request, compare the concepts directly in a table.
-8. For a practice request, ask questions based on the PDF.
-9. Correct misunderstandings politely and explain the correction.
-10. Never invent quotations, page numbers, or facts from the PDF.
-11. Use Markdown headings, lists, and tables for readability.
-12. Cover all relevant details found in the supplied excerpts.
+Use the uploaded PDF excerpts as your primary source.
+
+For questions about a topic, structure your response using:
+1. Complete definition
+2. Detailed explanation in simple English
+3. Main characteristics or key points
+4. Types, steps, or examples where relevant
+5. Advantages and disadvantages where relevant
+6. A comparison table when a meaningful comparison exists
+7. A short exam-ready answer
+
+For comparison questions, compare the requested concepts directly.
+Do not force comparisons when they are not useful.
+
+If the supplied excerpts do not contain the answer, say so clearly.
+Do not pretend you have searched the entire PDF if the selected excerpts
+do not support the answer. Label any extra general knowledge separately.
+
+Never invent quotations or page numbers. Correct misunderstandings
+politely. Use Markdown headings, bullet lists, and tables.
 """
 
     prompt = f"""
-STUDENT'S QUESTION:
+STUDENT QUESTION:
 {question}
 
-RELEVANT EXTRACTS FROM THE UPLOADED PDF:
+RELEVANT EXCERPTS FROM THE UPLOADED PDF:
 {context}
 
-Answer the question using the rules in your system instructions.
+Answer in simple, clear, exam-friendly English.
 """
-
-    return call_groq(client, system_prompt, prompt, history)
-
-
-def generate_practice(client, chunks, count, difficulty, practice_type):
-    """Create exam practice using sections from across the PDF."""
-    sample = "\n\n".join(
-        chunks[:min(len(chunks), 8)]
-    )
 
     return call_groq(
         client,
-        "You are an academic exam-practice creator. Use only the provided material.",
-        f"""
-Create {count} {difficulty.lower()} practice questions for exam revision.
-
-Question type: {practice_type}
-
-Use this PDF material:
-{sample[:45000]}
-
-Requirements:
-- Cover different topics, not just one section.
-- Make questions clear and suitable for a student.
-- Number every question.
-- For multiple-choice questions, give four options labelled A, B, C, D.
-- For short-answer questions, ask questions that test understanding.
-- For long questions, ask for definitions, explanations, or comparisons.
-- Provide a separate ANSWER KEY at the end.
-- Explain why answers are correct where useful.
-- Do not invent information absent from the PDF.
-"""
+        system_prompt,
+        prompt,
+        history=history
     )
 
 
-# -------------------- SIDEBAR --------------------
+# =========================================================
+# EXAM PRACTICE
+# =========================================================
+
+def generate_practice(client, chunks, count, difficulty, question_type):
+    # Sample from across the document, rather than only its beginning.
+    if len(chunks) <= 8:
+        selected = chunks
+    else:
+        indexes = [
+            round(i * (len(chunks) - 1) / 7)
+            for i in range(8)
+        ]
+        selected = [chunks[i] for i in indexes]
+
+    material = "\n\n".join(selected)
+
+    prompt = f"""
+Create {count} {difficulty.lower()} exam-practice questions.
+
+Question format: {question_type}
+
+Use this course material:
+{material[:45000]}
+
+Requirements:
+- Cover different topics from the provided material.
+- Use clear student-friendly language.
+- Number every question.
+- For MCQs, provide four options labelled A, B, C, D.
+- For short-answer questions, test understanding of key concepts.
+- For long-answer questions, ask for definitions, explanations,
+  steps, or comparisons.
+- Put the answer key under a separate heading at the end.
+- Explain answers where useful.
+- Do not invent course-specific facts.
+"""
+
+    return call_groq(
+        client,
+        "You create accurate exam practice from supplied study notes.",
+        prompt
+    )
+
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+
+for key, default in {
+    "messages": [],
+    "pdf_signature": None,
+    "pdf_text": "",
+    "pdf_chunks": [],
+    "page_count": 0,
+    "ocr_pages": 0,
+    "topic_outline": None,
+    "practice_result": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
 with st.sidebar:
     st.title("📚 Study Dashboard")
     st.caption("Your PDF-powered revision assistant")
@@ -310,12 +482,18 @@ with st.sidebar:
     uploaded_pdf = st.file_uploader(
         "Upload your study PDF",
         type=["pdf"],
-        help="Upload a text-based PDF containing your course notes."
+        help="Upload a text-based or scanned PDF."
+    )
+
+    st.caption(
+        "Large PDFs take longer to process. Gemini API usage limits "
+        "and charges may apply."
     )
 
     st.divider()
     st.markdown("### Features")
     st.markdown("""
+    - Automatic scanned-page OCR
     - Topic extraction
     - Definitions and explanations
     - Concept comparisons
@@ -328,7 +506,10 @@ with st.sidebar:
         st.rerun()
 
 
-# -------------------- MAIN HEADER --------------------
+# =========================================================
+# HEADER
+# =========================================================
+
 st.markdown("""
 <div class="hero">
     <h1>PDF Study AI</h1>
@@ -336,93 +517,113 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if not uploaded_pdf:
+
+# =========================================================
+# CHECK UPLOAD AND KEYS
+# =========================================================
+
+if uploaded_pdf is None:
     st.info("Upload your course PDF in the sidebar to begin.")
-    st.markdown("### How to use")
     st.markdown("""
+    ### How to use
     1. Upload your PDF notes.
-    2. Extract and review the topics.
-    3. Ask questions about any topic.
-    4. Study definitions, detailed explanations, and comparisons.
-    5. Generate practice questions and check the answer key.
+    2. Let the app extract text and recognize scanned pages.
+    3. Review the topic outline.
+    4. Ask questions about any topic.
+    5. Generate exam questions and review the answer key.
     """)
     st.stop()
 
+groq_key = get_secret("GROQ_API_KEY")
+gemini_key = get_secret("GEMINI_API_KEY")
 
-# -------------------- API CLIENT --------------------
-api_key = get_api_key()
-
-if not api_key:
-    st.error(
-        "Groq API key not found. Add GROQ_API_KEY to Streamlit Secrets "
-        "or your environment variables."
-    )
+if not groq_key:
+    st.error("GROQ_API_KEY is missing from Streamlit Secrets.")
     st.stop()
 
-client = Groq(api_key=api_key)
+if not gemini_key:
+    st.error("GEMINI_API_KEY is missing from Streamlit Secrets.")
+    st.stop()
 
-# -------------------- READ PDF --------------------
-pdf_signature = (
-    uploaded_pdf.name,
-    uploaded_pdf.size,
-    uploaded_pdf.getvalue()[:100]
-)
+groq_client = Groq(api_key=groq_key)
+gemini_client = genai.Client(api_key=gemini_key)
 
-if st.session_state.get("pdf_signature") != pdf_signature:
-    with st.spinner("Reading your PDF..."):
-        try:
-            pdf_text, page_count = extract_pdf_text(uploaded_pdf)
+# Hash file contents so a new PDF triggers a new extraction.
+pdf_hash = hashlib.sha256(uploaded_pdf.getvalue()).hexdigest()
 
-            st.session_state.pdf_text = pdf_text
-            st.session_state.pdf_chunks = split_text(pdf_text)
-            st.session_state.pdf_signature = pdf_signature
-            st.session_state.page_count = page_count
-            st.session_state.topic_outline = None
-            st.session_state.messages = []
-            st.session_state.practice_result = None
-
-        except ValueError as exc:
-            st.error(str(exc))
-            st.stop()
-
-if "messages" not in st.session_state:
+if st.session_state.pdf_signature != pdf_hash:
+    st.session_state.pdf_signature = None
+    st.session_state.pdf_text = ""
+    st.session_state.pdf_chunks = []
+    st.session_state.topic_outline = None
+    st.session_state.practice_result = None
     st.session_state.messages = []
 
-if "practice_result" not in st.session_state:
-    st.session_state.practice_result = None
+    try:
+        with st.spinner(
+            "Extracting PDF text and using Gemini OCR on scanned pages..."
+        ):
+            text, page_count, ocr_pages = extract_pdf_text(
+                uploaded_pdf,
+                gemini_client
+            )
 
-pdf_text = st.session_state.pdf_text
-chunks = st.session_state.pdf_chunks
+            chunks = split_text(text)
 
-# -------------------- PDF INFORMATION --------------------
+            st.session_state.pdf_text = text
+            st.session_state.pdf_chunks = chunks
+            st.session_state.page_count = page_count
+            st.session_state.ocr_pages = ocr_pages
+            st.session_state.pdf_signature = pdf_hash
+
+    except Exception as exc:
+        st.error(
+            "PDF processing failed. Check your Gemini API key, model "
+            "access, PDF size, and API usage limits."
+        )
+        st.caption(f"Technical detail: {str(exc)[:500]}")
+        st.stop()
+
+# =========================================================
+# PDF SUMMARY METRICS
+# =========================================================
+
 col1, col2, col3 = st.columns(3)
 
 col1.metric("PDF pages", st.session_state.page_count)
-col2.metric("Text chunks", len(chunks))
-col3.metric("Extracted characters", f"{len(pdf_text):,}")
+col2.metric("Scanned pages processed", st.session_state.ocr_pages)
+col3.metric("Text chunks", len(st.session_state.pdf_chunks))
 
-if len(pdf_text) > MAX_PDF_CHARS:
-    st.warning(
-        "This is a large PDF. The app can read it, but the topic extractor "
-        "may require several API requests and can reach usage limits."
-    )
+st.success(
+    "PDF text extraction is complete. You can now ask questions."
+)
+
+chunks = st.session_state.pdf_chunks
+pdf_text = st.session_state.pdf_text
+
+# =========================================================
+# MAIN TABS
+# =========================================================
 
 tab_chat, tab_topics, tab_practice, tab_pdf = st.tabs([
     "💬 Ask Questions",
     "📖 All Topics",
     "📝 Exam Practice",
-    "📄 PDF Preview"
+    "📄 PDF Text"
 ])
 
-# -------------------- CHAT TAB --------------------
+# =========================================================
+# CHAT TAB
+# =========================================================
+
 with tab_chat:
     st.subheader("Ask your PDF")
 
     quick_prompts = [
-        "Explain the most important topics",
-        "Give me a complete definition and explanation",
-        "Compare the important concepts",
-        "Give me short exam notes"
+        "Explain the important topics",
+        "Give a complete definition and explanation",
+        "Compare related concepts",
+        "Give me short exam notes",
     ]
 
     prompt_cols = st.columns(2)
@@ -456,52 +657,61 @@ with tab_chat:
             st.markdown(question)
 
         with st.chat_message("assistant"):
-            with st.spinner("Studying your PDF..."):
+            with st.spinner("Finding relevant PDF content..."):
                 try:
-                    recent_history = st.session_state.messages[:-1]
-                    response = answer_question(
-                        client,
+                    history = st.session_state.messages[:-1]
+
+                    answer = answer_question(
+                        groq_client,
                         question,
                         chunks,
-                        history=recent_history
+                        history=history
                     )
-                    st.markdown(response)
+
+                    st.markdown(answer)
 
                     st.session_state.messages.append({
                         "role": "assistant",
-                        "content": response
+                        "content": answer
                     })
 
                 except Exception as exc:
                     st.error(
-                        "The answer could not be generated. Check your "
-                        "Groq model access, API key, and usage limits."
+                        "Could not generate an answer. Check Groq model "
+                        "access, API key, and usage limits."
                     )
-                    st.caption(f"Technical detail: {str(exc)[:300]}")
+                    st.caption(f"Technical detail: {str(exc)[:400]}")
                     st.session_state.messages.pop()
 
-# -------------------- TOPICS TAB --------------------
+# =========================================================
+# TOPICS TAB
+# =========================================================
+
 with tab_topics:
     st.subheader("Complete Topic Outline")
+
     st.write(
-        "Generate an organized outline of the main topics and subtopics "
-        "found throughout your PDF."
+        "Generate an organized outline of topics and subtopics "
+        "from your extracted PDF content."
     )
 
     if st.button("Extract All Topics", type="primary"):
-        with st.spinner("Analysing PDF sections and organizing topics..."):
+        with st.spinner("Organizing topics from your PDF..."):
             try:
-                outline = build_topic_list(client, chunks)
-                st.session_state.topic_outline = outline
+                st.session_state.topic_outline = build_topic_list(
+                    groq_client,
+                    chunks
+                )
             except Exception as exc:
                 st.error(
-                    "Topic extraction failed. Check the Groq API key, "
-                    "model access, and usage limits."
+                    "Topic extraction failed. Check your Groq API key, "
+                    "model availability, and usage limits."
                 )
-                st.caption(f"Technical detail: {str(exc)[:300]}")
+                st.caption(f"Technical detail: {str(exc)[:400]}")
 
-    if st.session_state.get("topic_outline"):
+    if st.session_state.topic_outline:
         st.markdown(st.session_state.topic_outline)
+
         st.download_button(
             "Download topic outline",
             data=st.session_state.topic_outline,
@@ -509,12 +719,17 @@ with tab_topics:
             mime="text/markdown"
         )
 
-# -------------------- PRACTICE TAB --------------------
+# =========================================================
+# PRACTICE TAB
+# =========================================================
+
 with tab_practice:
     st.subheader("Exam Practice")
-    st.write("Generate questions from your PDF and review the answer key.")
+    st.write(
+        "Generate practice questions from the extracted study material."
+    )
 
-    practice_type = st.selectbox(
+    question_type = st.selectbox(
         "Question format",
         [
             "Mixed questions",
@@ -537,25 +752,25 @@ with tab_practice:
     )
 
     if st.button("Generate Practice Questions", type="primary"):
-        with st.spinner("Creating exam practice from your PDF..."):
+        with st.spinner("Creating practice questions..."):
             try:
-                result = generate_practice(
-                    client,
+                st.session_state.practice_result = generate_practice(
+                    groq_client,
                     chunks,
                     question_count,
                     difficulty,
-                    practice_type
+                    question_type
                 )
-                st.session_state.practice_result = result
             except Exception as exc:
                 st.error(
-                    "Practice generation failed. Check the API key, "
-                    "model access, and usage limits."
+                    "Practice generation failed. Check your Groq API "
+                    "key, model access, and usage limits."
                 )
-                st.caption(f"Technical detail: {str(exc)[:300]}")
+                st.caption(f"Technical detail: {str(exc)[:400]}")
 
     if st.session_state.practice_result:
         st.markdown(st.session_state.practice_result)
+
         st.download_button(
             "Download practice questions",
             data=st.session_state.practice_result,
@@ -563,29 +778,33 @@ with tab_practice:
             mime="text/markdown"
         )
 
-# -------------------- PDF TAB --------------------
+# =========================================================
+# EXTRACTED PDF TEXT TAB
+# =========================================================
+
 with tab_pdf:
-    st.subheader("PDF Content Preview")
+    st.subheader("Extracted PDF Text")
+
     st.caption(
-        "Showing extracted text. This preview is limited to the first "
-        "12,000 characters."
+        "Previewing the first 15,000 characters of the extracted text."
     )
 
     st.text_area(
-        "Extracted PDF text",
-        value=pdf_text[:12000],
+        "Recognized text",
+        value=pdf_text[:15000],
         height=450
     )
 
     st.download_button(
-        "Download extracted text",
+        "Download all extracted text",
         data=pdf_text,
         file_name="extracted_pdf_text.txt",
         mime="text/plain"
     )
 
 st.divider()
+
 st.caption(
-    "PDF Study AI | Answers are generated by AI. Verify important "
-    "exam details against your original course notes."
+    "PDF Study AI | AI-generated answers can contain errors. "
+    "Verify important exam details against your original notes."
 )
