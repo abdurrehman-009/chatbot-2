@@ -19,7 +19,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 GEMINI_OCR_MODEL = "gemini-2.5-flash"
 
 MAX_HISTORY_MESSAGES = 8
